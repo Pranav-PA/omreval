@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "next lint",
     "py:dev": "python devserver.py",
-    "py:test": "python tests/test_synthetic_45.py && python tests/test_real_layout_60.py && python tests/test_noisy_scan.py"
+    "py:test": "python tests/test_synthetic_45.py && python tests/test_real_layout_60.py && python tests/test_noisy_scan.py && python tests/test_lattice_recovery.py"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
