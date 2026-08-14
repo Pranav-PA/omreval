@@ -125,25 +125,49 @@ endpoints then reject any request that does not carry it.
 
 ## How it works
 
+### Why the grid is not auto-detected
+
+Earlier versions discovered the answer grid from a photo of the blank sheet.
+Every failure that produced was a discovery failure, and each fix traded one for
+another:
+
+- the roll-number block is genuinely indistinguishable from answer groups — a
+  partially detected row of eleven leaves exactly four survivors
+- faintly printed rows vanish, and because questions were numbered by list
+  position, every question after a gap silently shifted
+- an inferred row pitch can land on half the true spacing, which fits every row
+  the true pitch does and crushes the grid into a band
+
+The premise was wrong: a photo does not determine the grid unambiguously. So the
+teacher places four markers once per college sheet and the geometry follows
+exactly. Detection is demoted to suggesting where those markers start, and is
+allowed to be wrong there in a way it never was when it defined the grid.
+
 ### Template creation (`/templates/create`)
 
-1. The blank sheet is downscaled to 1600 px in the browser and posted to
-   `POST /api/detect-bubbles`, which stores it and forwards it to the Python
-   service.
-2. `detect_bubbles` thresholds the sheet (adaptive **and** Otsu, keeping
-   whichever gives the better grid), finds contours, and keeps the ones that are
-   circular, consistently sized and consistently spaced.
-3. Bubbles are clustered into rows by *y*, split into questions by the wide gaps
-   between option groups, and grouped into printed columns by *x*. Questions are
-   then numbered down each column (the usual NEET/JEE layout) or across each
-   row — the teacher picks which.
-4. The overlay on screen is editable: any bubble can be dragged, or selected and
-   nudged with the arrow keys. A whole group can also be deleted — useful when
-   the sheet's roll-number block gets picked up as extra "questions", since
-   those bubbles look identical to answer bubbles. The remaining questions
-   renumber themselves.
+1. The teacher states the layout — columns × questions-per-column × options —
+   and uploads the blank sheet, downscaled to 1600 px in the browser.
+2. `POST /api/suggest-anchors` stores it and asks the Python service where the
+   four markers probably go. Contour detection is used here, but only as a
+   starting position.
+3. The teacher drags four markers onto the bubbles they name: question 1 option
+   A, question 1's last option, option A of the bottom row of column one, and
+   option A of the top row of the last column. A magnifier follows the active
+   marker so it can be placed on the exact centre, and arrow keys nudge by one
+   pixel.
+4. Every bubble centre is interpolated from those four points and drawn live, so
+   the whole grid moves under the cursor and is confirmed visually before
+   anything is saved. Because the steps are 2-D vectors, a sheet scanned rotated
+   or sheared reconstructs exactly.
 5. The answer key (A–D per question, with a paste-the-whole-key shortcut) is
    saved alongside the geometry via `POST /api/save-template`.
+
+The same interpolation exists twice — [`api/py/_geometry.py`](api/py/_geometry.py)
+for scoring and [`src/lib/grid.ts`](src/lib/grid.ts) for the live overlay, since
+the browser cannot ask the server on every pointer event.
+`tests/test_grid_parity.mjs` compiles the real TypeScript and diffs it against
+the Python; they agree to 0.0000px. Divergence there would sample bubbles
+somewhere other than where the teacher saw them.
 
 ### Evaluation (`/evaluate`)
 
@@ -227,7 +251,7 @@ templates or results.
 |---|---|---|
 | `POST /api/auth/signup` | `{ email, password }` | `{ ok, needs_confirmation }` |
 | `POST /api/auth/login` | `{ email, password }` | `{ ok, user_id, access_token }` |
-| `POST /api/detect-bubbles` | multipart: `image`, `numbering` | `{ positions, image_url, image_path }` |
+| `POST /api/suggest-anchors` | multipart: `image`, `columns`, `rows`, `options` | `{ suggestion, image_url, image_path }` |
 | `POST /api/save-template` | `{ college_name, template_image_url, template_image_path, bubble_positions, answer_key }` | `{ ok, template_id }` |
 | `GET /api/templates` | — | `{ templates: [...] }` |
 | `POST /api/evaluate-omr` | multipart: `template_id`, `student_name`, `roll_number`, `image` | `{ ok, evaluation_id, result }` |
