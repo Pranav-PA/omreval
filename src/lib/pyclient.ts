@@ -3,21 +3,35 @@ import { headers } from 'next/headers';
 /**
  * Calls the Python (OpenCV) service.
  *
- * In production the functions live in the same Vercel deployment under
- * /api/py/*, so we resolve the current origin. For local `npm run dev` set
- * PYTHON_API_URL to the devserver.py address.
+ * In production the functions live in the same deployment under /api/py/*, so
+ * we call our own origin. For local `npm run dev` set PYTHON_API_URL to the
+ * devserver.py address.
+ *
+ * Resolution order matters. `VERCEL_URL` is the *deployment-specific* hostname
+ * (omreval-<hash>-<team>.vercel.app), and Vercel's Deployment Protection guards
+ * exactly those generated URLs while leaving the production alias public. Using
+ * it means this server-to-server hop gets bounced to Vercel SSO and comes back
+ * 401 "Protected deployment", even though the site itself loads fine. So prefer
+ * the host the request actually arrived on, which is by definition reachable.
  */
 async function baseUrl(): Promise<string> {
   const explicit = process.env.PYTHON_API_URL?.trim();
   if (explicit) return explicit.replace(/\/$/, '');
 
-  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
-
   const h = await headers();
   const host = h.get('x-forwarded-host') ?? h.get('host');
-  const proto = h.get('x-forwarded-proto') ?? 'http';
-  if (!host) throw new Error('Cannot resolve the image service URL.');
-  return `${proto}://${host}`;
+  if (host) {
+    const proto = h.get('x-forwarded-proto') ?? (host.startsWith('localhost') ? 'http' : 'https');
+    return `${proto}://${host}`;
+  }
+
+  // The stable public alias, if the platform tells us what it is.
+  const productionUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim();
+  if (productionUrl) return `https://${productionUrl}`;
+
+  if (process.env.VERCEL_URL) return `https://${process.env.VERCEL_URL}`;
+
+  throw new Error('Cannot resolve the image service URL.');
 }
 
 export class PyServiceError extends Error {
@@ -82,6 +96,12 @@ export async function callPython<T>(
   if (process.env.PY_SHARED_SECRET) {
     headersInit['X-OMREval-Secret'] = process.env.PY_SHARED_SECRET;
   }
+  // Present only if "Protection Bypass for Automation" is enabled. Lets this
+  // internal hop through even when Deployment Protection covers every URL.
+  if (process.env.VERCEL_AUTOMATION_BYPASS_SECRET) {
+    headersInit['x-vercel-protection-bypass'] = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+    headersInit['x-vercel-set-bypass-cookie'] = 'false';
+  }
 
   let response: Response;
   try {
@@ -90,6 +110,10 @@ export async function callPython<T>(
       headers: headersInit,
       body: JSON.stringify(body),
       cache: 'no-store',
+      // Do not chase a redirect. Deployment Protection answers with a 307 to
+      // Vercel's SSO page; following it turns a diagnosable 401 into an
+      // unparseable HTML login form.
+      redirect: 'manual',
     });
   } catch {
     throw new PyServiceError(
@@ -98,12 +122,30 @@ export async function callPython<T>(
     );
   }
 
+  if (response.status >= 300 && response.status < 400) {
+    const target = response.headers.get('location') ?? '';
+    if (/vercel\.com\/sso-api|\/sso\b/.test(target)) {
+      throw new PyServiceError(
+        'The image processing service is behind Vercel Deployment Protection, so the ' +
+          'app cannot reach its own function. Disable protection for this project, or ' +
+          'enable Protection Bypass for Automation.',
+        502,
+      );
+    }
+    throw new PyServiceError(
+      `The image processing service redirected unexpectedly (HTTP ${response.status}).`,
+    );
+  }
+
   const text = await response.text();
   let payload: unknown;
   try {
     payload = text ? JSON.parse(text) : {};
   } catch {
-    throw new PyServiceError('The image processing service returned an invalid response.');
+    throw new PyServiceError(
+      `The image processing service returned a non-JSON response (HTTP ${response.status}).`,
+      response.status === 401 || response.status === 403 ? 502 : 502,
+    );
   }
 
   if (!response.ok) {
