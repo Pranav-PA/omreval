@@ -184,13 +184,18 @@ corner extremes) has the same weakness for the same reason: two lattices whose
 extents differ slightly register one row out.
 
 So evaluation re-detects the grid on the student sheet and reads the marks at
-the student's *own* bubble positions. Question *N* is question *N* on both
-sheets because both are ordered by the same deterministic rule, so there is no
-correspondence to get wrong. The template is then only needed for the answer key
-and the expected shape of the grid.
+the student's *own* bubble positions. Student groups are then matched to
+template questions **by position**, not by list index — a real scan routinely
+loses or invents a group to noise, and index matching would shift every
+subsequent answer by one. A question with no matching group is reported as
+unreadable rather than being read from its neighbour's bubbles.
 
-Registration is kept as a fallback for sheets whose grid cannot be re-detected,
-and the result page states which method was used.
+**There is deliberately no fallback.** Warping onto the template and sampling at
+template coordinates was measured returning **9 of 60** answers correct on a
+noisy sheet while reporting no error at all — the lattice makes an off-by-one-row
+registration fit beautifully. Marks that are quietly wrong are far worse for a
+student than an evaluation that declines, so if the grid cannot be read the
+request fails with an explanation instead.
 
 **Known limitation:** a bubble grid looks identical rotated 180°, so geometry
 alone cannot tell an upside-down sheet from an upright one. Deskew resolves
@@ -265,7 +270,9 @@ Everything adjustable lives at the top of
 | `MIN_BUBBLE_R` / `MAX_BUBBLE_R` | Bubble radius range in normalised px |
 | `MIN_CIRCULARITY` | How round a contour must be to be a bubble |
 | `INNER_RADIUS_FACTOR` | How far inside the printed ring to sample (0.70) |
-| `MIN_GOOD_MATCHES` / `MIN_INLIERS` | Strictness of the fallback registration |
+| `MIN_GRID_COMPLETENESS` | Fraction of question rows that must be found (0.8) |
+| `MAX_UNREADABLE_FRACTION` | Above this, decline instead of reporting marks (0.2) |
+| `MAX_ANGLE_POINTS` / `MAX_CANDIDATES` | Work caps that keep a noisy scan inside the function timeout |
 
 If a particular college sheet detects badly, raise `MIN_CIRCULARITY` (fewer
 false positives from letters and boxes) or widen the radius range (bubbles
@@ -297,6 +304,11 @@ npm run py:test
   block. Confirms those blocks are *not* mistaken for answer groups, and reads
   the sheet at 0°, 3.5°, −8° and 12° rotation.
 
+- `tests/test_noisy_scan.py` — the important one. Adds speckle, stray printed
+  blocks and sensor grain, because clean synthetic sheets hide two whole classes
+  of bug: the pairwise geometry is quadratic in the candidate count (fine at
+  ~250 candidates, gigabytes at 20,000), and losing a single group to noise used
+  to invalidate the entire read. Asserts both accuracy and a time budget.
 - `tests/test_http_endpoints.py` — drives the two serverless endpoints over HTTP
   the way the Next.js layer does, and checks that a corrupt image and a missing
   field come back as clean 422s rather than stack traces. Needs

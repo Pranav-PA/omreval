@@ -42,10 +42,18 @@ MIN_MARGIN = 0.18            # gap between best and runner-up to be confident
 INNER_RADIUS_FACTOR = 0.70   # sample inside the printed ring, not on it
 
 # Alignment
-ORB_FEATURES = 6000
-LOWE_RATIO = 0.78
-MIN_GOOD_MATCHES = 14
-MIN_INLIERS = 10
+# Grid reading
+MIN_GRID_COMPLETENESS = 0.8   # fraction of question rows that must be found
+MAX_UNREADABLE_FRACTION = 0.2 # above this, decline rather than report marks
+
+# Work limits. A clean scan yields a few hundred bubble candidates, but a real
+# photo (paper texture, JPEG noise, printed instructions) can yield tens of
+# thousands, and the pairwise geometry below is quadratic in that count. Without
+# these caps a noisy sheet exhausts memory or the function timeout instead of
+# just detecting badly.
+MAX_ANGLE_POINTS = 4000      # points used to estimate sheet skew
+ANGLE_CHUNK = 512            # rows per distance-matrix block
+MAX_CANDIDATES = 60000       # hard ceiling on contour candidates
 
 OPTION_LABELS = ["A", "B", "C", "D", "E", "F"]
 
@@ -138,17 +146,38 @@ def _candidate_bubbles(binary):
 
 
 def _dedupe(bubbles):
-    """A filled bubble often produces both an outer and an inner contour."""
-    bubbles = sorted(bubbles, key=lambda b: -b[2])
+    """A filled bubble often produces both an outer and an inner contour.
+
+    Bucketed by position rather than compared pairwise: on a noisy scan the
+    candidate list runs to tens of thousands, and an all-pairs scan there is
+    slow enough to hit the function timeout on its own.
+    """
+    if not bubbles:
+        return []
+    bubbles = sorted(bubbles, key=lambda b: -b[2])[:MAX_CANDIDATES]
+
+    # Any pair closer than largest_radius * 0.85 must land in the same or an
+    # adjacent cell, so a 3x3 neighbourhood check is exhaustive.
+    cell = max(2.0, bubbles[0][2] * 0.85)
+    buckets = {}
     kept = []
+
     for cx, cy, r in bubbles:
+        gx, gy = int(cx // cell), int(cy // cell)
         duplicate = False
-        for kx, ky, kr in kept:
-            if math.hypot(cx - kx, cy - ky) < max(kr, r) * 0.85:
-                duplicate = True
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for kx, ky, kr in buckets.get((gx + dx, gy + dy), ()):
+                    if math.hypot(cx - kx, cy - ky) < max(kr, r) * 0.85:
+                        duplicate = True
+                        break
+                if duplicate:
+                    break
+            if duplicate:
                 break
         if not duplicate:
             kept.append((cx, cy, r))
+            buckets.setdefault((gx, gy), []).append((cx, cy, r))
     return kept
 
 
@@ -348,13 +377,25 @@ def _grid_angle(points):
     pts = np.asarray(points, dtype=np.float32)
     if len(pts) < 4:
         return 0.0
-    deltas = pts[:, None, :] - pts[None, :, :]
-    distances = np.sqrt((deltas ** 2).sum(axis=2))
-    np.fill_diagonal(distances, np.inf)
-    nearest = np.argmin(distances, axis=1)
 
-    vectors = pts[nearest] - pts
-    angles = np.degrees(np.arctan2(vectors[:, 1], vectors[:, 0]))
+    # A median only needs a representative sample, and the full pairwise matrix
+    # is quadratic: 20k points would be gigabytes.
+    if len(pts) > MAX_ANGLE_POINTS:
+        pts = pts[np.linspace(0, len(pts) - 1, MAX_ANGLE_POINTS).astype(int)]
+
+    collected = []
+    for start in range(0, len(pts), ANGLE_CHUNK):
+        block = pts[start:start + ANGLE_CHUNK]
+        deltas = block[:, None, :] - pts[None, :, :]
+        distances = np.sqrt((deltas ** 2).sum(axis=2))
+        # Exclude each point from being its own nearest neighbour.
+        rows = np.arange(len(block))
+        distances[rows, start + rows] = np.inf
+        nearest = np.argmin(distances, axis=1)
+        vectors = pts[nearest] - block
+        collected.append(np.degrees(np.arctan2(vectors[:, 1], vectors[:, 0])))
+
+    angles = np.concatenate(collected)
     # A row direction has no sign, so fold onto (-90, 90].
     angles = (angles + 90.0) % 180.0 - 90.0
     return float(np.median(angles))
@@ -387,188 +428,6 @@ def deskew_to_grid(gray, expected_count=None):
     return _rotate(gray, angle), angle
 
 
-def _box_corners(points):
-    """Corners of the minimum-area rectangle enclosing a point cloud.
-
-    Deliberately not the extreme points (argmin/argmax of x±y): a single stray
-    detection moves an extreme corner by a whole bubble and throws the entire
-    registration off by one option. The min-area rectangle is driven by the
-    convex hull as a whole, so it barely moves.
-    """
-    rect = cv2.minAreaRect(np.asarray(points, dtype=np.float32))
-    return cv2.boxPoints(rect).astype(np.float32)
-
-
-def _pair_up(mapped, template_pts, tolerance):
-    """Nearest template bubble for each mapped student bubble, within tolerance.
-    Returns (keep_mask, nearest_index)."""
-    deltas = mapped[:, None, :] - template_pts[None, :, :]
-    distances = np.sqrt((deltas ** 2).sum(axis=2))
-    nearest = np.argmin(distances, axis=1)
-    best = distances[np.arange(len(mapped)), nearest]
-    return best < tolerance, nearest
-
-
-def align_by_grid(template_points, student_gray, template_shape):
-    """Register the student sheet using the bubble grid geometry.
-
-    Appearance-based matching (ORB/SIFT) is unreliable on an OMR sheet: the page
-    is a lattice of near-identical circles, so descriptors match ambiguously and
-    RANSAC will happily settle on a consistent-but-wrong fit that is off by a
-    whole row. Matching by *geometry* instead removes that ambiguity.
-
-    Two stages:
-      1. Coarse - map the four extreme corners of the student's bubble cloud
-         onto the template's. This absorbs rotation, skew and perspective.
-      2. Refine - push every template bubble through the coarse transform, pair
-         it with the nearest detected student bubble, and re-fit a homography
-         over all those pairs with RANSAC.
-
-    Returns (H, info) where H maps student -> template, or (None, info).
-    """
-    info = {"method": "grid", "student_bubbles": 0, "pairs": 0, "inliers": 0, "reason": None}
-
-    template_pts = np.asarray(template_points, dtype=np.float32)
-    if len(template_pts) < 8:
-        info["reason"] = "template has too few bubbles to register against"
-        return None, info
-
-    student = _detect_bubble_points(student_gray, expected_count=len(template_pts))
-    info["student_bubbles"] = len(student)
-    if len(student) < 8:
-        info["reason"] = "could not find the bubble grid on the student sheet"
-        return None, info
-
-    student_pts = np.float32([[b[0], b[1]] for b in student])
-    median_r = float(np.median([b[2] for b in student])) or 8.0
-    tolerance = max(median_r * 1.6, 6.0)
-
-    student_box = _box_corners(student_pts)
-    template_box = _box_corners(template_pts)
-
-    # boxPoints does not guarantee which physical corner comes first, so try all
-    # four cyclic pairings and keep whichever actually lines the grids up. This
-    # is also what lets a sheet photographed sideways register correctly.
-    best = None
-    for shift in range(4):
-        rolled = np.roll(student_box, shift, axis=0).astype(np.float32)
-        try:
-            candidate = cv2.getPerspectiveTransform(rolled, template_box)
-        except cv2.error:
-            continue
-        mapped = cv2.perspectiveTransform(
-            student_pts.reshape(-1, 1, 2), candidate
-        ).reshape(-1, 2)
-        keep, nearest = _pair_up(mapped, template_pts, tolerance)
-        pairs = int(keep.sum())
-        # Tie-break towards the least-rotated fit: a bubble grid looks the same
-        # upside down, so 0 and 180 degrees score identically on geometry alone
-        # and teachers photograph sheets roughly upright.
-        skew = float(np.linalg.norm(candidate[:2, :2] - np.eye(2)))
-        if best is None or (pairs, -skew) > (best[0], -best[1]):
-            best = (pairs, skew, keep, nearest)
-
-    if best is None or best[0] < 8:
-        info["reason"] = "the student sheet's bubble grid did not line up with the template"
-        return None, info
-
-    _, _, keep, nearest = best
-    src = student_pts[keep].reshape(-1, 1, 2)
-    dst = template_pts[nearest[keep]].reshape(-1, 1, 2)
-    info["pairs"] = int(keep.sum())
-
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
-    info["inliers"] = int(mask.sum()) if mask is not None else 0
-
-    th, tw = template_shape[:2]
-    if H is None or info["inliers"] < 8 or not _homography_is_sane(H, tw, th):
-        info["reason"] = "could not compute a reliable alignment from the bubble grid"
-        return None, info
-
-    return H, info
-
-
-def _homography_is_sane(H, w, h):
-    """Reject warps that fold, mirror or explode the sheet."""
-    if H is None:
-        return False
-    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
-    try:
-        mapped = cv2.perspectiveTransform(corners, np.linalg.inv(H))
-    except np.linalg.LinAlgError:
-        return False
-    pts = mapped.reshape(-1, 2)
-    area = abs(cv2.contourArea(pts.astype(np.float32)))
-    if area < 0.15 * w * h or area > 6.0 * w * h:
-        return False
-    if not cv2.isContourConvex(pts.astype(np.float32)):
-        return False
-    return True
-
-
-def align_to_template(template_gray, student_gray, template_points=None):
-    """Warp the student photo onto the template's frame.
-
-    Grid registration is tried first and is what should normally succeed; ORB
-    feature matching is only a fallback for sheets whose bubbles could not be
-    detected. Returns (warped_gray, info); if nothing works the student image is
-    merely resized and info['aligned'] is False.
-    """
-    th, tw = template_gray.shape[:2]
-    info = {"aligned": False, "method": None, "matches": 0, "inliers": 0, "reason": None}
-
-    if template_points is not None and len(template_points) >= 8:
-        H, grid_info = align_by_grid(template_points, student_gray, template_gray.shape)
-        if H is not None:
-            info.update({
-                "aligned": True,
-                "method": "grid",
-                "matches": grid_info["pairs"],
-                "inliers": grid_info["inliers"],
-                "reason": None,
-            })
-            return cv2.warpPerspective(
-                student_gray, H, (tw, th),
-                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
-            ), info
-        info["reason"] = grid_info["reason"]
-
-    # ---- fallback: appearance-based matching ----
-    orb = cv2.ORB_create(nfeatures=ORB_FEATURES)
-    kp_t, des_t = orb.detectAndCompute(template_gray, None)
-    kp_s, des_s = orb.detectAndCompute(student_gray, None)
-
-    if des_t is None or des_s is None or len(kp_t) < 10 or len(kp_s) < 10:
-        info["reason"] = "not enough detail in one of the images"
-        return cv2.resize(student_gray, (tw, th), interpolation=cv2.INTER_AREA), info
-
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-    raw = matcher.knnMatch(des_s, des_t, k=2)
-    good = [m for m, n in (p for p in raw if len(p) == 2) if m.distance < LOWE_RATIO * n.distance]
-    info["matches"] = len(good)
-
-    if len(good) < MIN_GOOD_MATCHES:
-        info["reason"] = "too few matching features"
-        return cv2.resize(student_gray, (tw, th), interpolation=cv2.INTER_AREA), info
-
-    src = np.float32([kp_s[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-    dst = np.float32([kp_t[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-    H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
-    inliers = int(mask.sum()) if mask is not None else 0
-    info["inliers"] = inliers
-
-    if H is None or inliers < MIN_INLIERS or not _homography_is_sane(H, tw, th):
-        info["reason"] = "could not compute a reliable alignment"
-        return cv2.resize(student_gray, (tw, th), interpolation=cv2.INTER_AREA), info
-
-    warped = cv2.warpPerspective(
-        student_gray, H, (tw, th),
-        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
-    )
-    info["aligned"] = True
-    info["method"] = "features"
-    info["reason"] = None
-    return warped, info
 
 
 # --------------------------------------------------------------------------
@@ -632,6 +491,75 @@ def _decide(ratios):
     return None, "blank", margin
 
 
+def _group_centres(questions):
+    return np.array(
+        [
+            [
+                float(np.mean([o["x"] for o in q["options"]])),
+                float(np.mean([o["y"] for o in q["options"]])),
+            ]
+            for q in questions
+        ],
+        dtype=np.float32,
+    )
+
+
+def _robust_scale_shift(src, dst):
+    """Map src onto dst on one axis, using percentiles so that a missing group
+    at either end cannot skew the fit the way min/max would."""
+    slo, shi = np.percentile(src, 5), np.percentile(src, 95)
+    dlo, dhi = np.percentile(dst, 5), np.percentile(dst, 95)
+    if shi - slo < 1e-6:
+        return 1.0, float(dlo - slo)
+    scale = float((dhi - dlo) / (shi - slo))
+    return scale, float(dlo - slo * scale)
+
+
+def _match_groups(student_questions, template_questions):
+    """Pair each template question with the student group in the same position.
+
+    Matching by list index breaks the moment noise costs a single group: every
+    later question silently shifts by one. Matching by geometry instead means a
+    lost group costs only that question, which is then reported as unreadable.
+
+    Returns a list, one entry per template question, holding the student group
+    or None.
+    """
+    if not student_questions:
+        return [None] * len(template_questions)
+
+    s_pts = _group_centres(student_questions)
+    t_pts = _group_centres(template_questions)
+
+    sx, tx = _robust_scale_shift(s_pts[:, 0], t_pts[:, 0])
+    sy, ty = _robust_scale_shift(s_pts[:, 1], t_pts[:, 1])
+    mapped = np.column_stack([s_pts[:, 0] * sx + tx, s_pts[:, 1] * sy + ty])
+
+    # Tolerance: comfortably under the gap between neighbouring groups, so a
+    # question can never claim its neighbour's marks.
+    if len(t_pts) > 1:
+        spread = np.sqrt(((t_pts[:, None, :] - t_pts[None, :, :]) ** 2).sum(axis=2))
+        np.fill_diagonal(spread, np.inf)
+        tolerance = float(np.median(spread.min(axis=1))) * 0.45
+    else:
+        tolerance = 40.0
+
+    distances = np.sqrt(((mapped[:, None, :] - t_pts[None, :, :]) ** 2).sum(axis=2))
+
+    matches = [None] * len(template_questions)
+    taken = set()
+    # Greedy over the closest pairs first so a contested slot goes to the best fit.
+    order = np.dstack(np.unravel_index(np.argsort(distances, axis=None), distances.shape))[0]
+    for si, ti in order:
+        if distances[si, ti] > tolerance:
+            break
+        if si in taken or matches[ti] is not None:
+            continue
+        matches[ti] = student_questions[si]
+        taken.add(int(si))
+    return matches
+
+
 def _read_student_grid(s_gray, question_count, options_per_question, numbering):
     """Deskew the student sheet and detect its own bubble grid.
 
@@ -661,18 +589,19 @@ def _read_student_grid(s_gray, question_count, options_per_question, numbering):
         info["reason"] = "could not find a bubble grid on the student sheet"
         return None, info
 
-    student_questions = best[1]
+    student_questions = [
+        q for q in best[1] if len(q["options"]) == options_per_question
+    ]
     info["matches"] = len(student_questions)
 
-    if len(student_questions) != question_count:
+    # A noisy scan routinely loses or invents a group. Demanding an exact count
+    # would throw away an otherwise perfect read, so accept a near-complete grid
+    # and let position matching decide which questions are actually readable.
+    if len(student_questions) < question_count * MIN_GRID_COMPLETENESS:
         info["reason"] = (
-            "found %d question rows on the student sheet but the template has %d"
+            "only found %d of %d question rows on the student sheet"
             % (len(student_questions), question_count)
         )
-        return None, info
-
-    if any(len(q["options"]) != options_per_question for q in student_questions):
-        info["reason"] = "the student sheet's option groups are incomplete"
         return None, info
 
     info["aligned"] = True
@@ -698,54 +627,69 @@ def evaluate_sheet(template_bytes, student_bytes, positions):
         # Template re-encoded since detection; fall back to the stored frame.
         t_gray = cv2.resize(t_gray, (stored_w, stored_h), interpolation=cv2.INTER_AREA)
 
-    template_points = [
-        (o["x"], o["y"]) for q in questions for o in (q.get("options") or [])
-    ]
     options_per_question = int(positions.get("options_per_question") or 4)
     numbering = positions.get("numbering") or "column"
 
-    # ---- preferred path: read the student sheet's own grid ----
+    # Read the student sheet's own grid.
     #
-    # Warping the student photo onto the template and sampling at the template's
+    # Warping the photo onto the template and sampling at the template's
     # coordinates sounds natural, but an OMR sheet is a lattice of identical
-    # circles: any registration that is off by one row still "fits" beautifully,
-    # and every answer silently shifts by a question. Re-detecting the grid on
-    # the student sheet avoids the problem entirely - question N is question N
-    # in both sheets because both are ordered by the same deterministic rule.
+    # circles: any registration that is off by one row still fits beautifully,
+    # and every answer silently shifts by a question. Detecting the grid on the
+    # student sheet and matching it to the template by position avoids that -
+    # and a group lost to noise costs one question instead of all of them.
     grid, align_info = _read_student_grid(
         s_gray, len(questions), options_per_question, numbering
     )
 
     if grid is not None:
         binary, student_questions = grid
-        results = []
-        for i, q in enumerate(questions):
-            opts = student_questions[i]["options"]
-            ratios = [_fill_ratio(binary, o["x"], o["y"], o["r"]) for o in opts]
-            answer, state, margin = _decide(ratios)
-            results.append({
-                "q": int(q["q"]),
-                "detected": answer,
-                "state": state,
-                "margin": round(float(margin), 3),
-                "fill": [round(float(v), 3) for v in ratios],
-            })
-    else:
-        # ---- fallback: register the sheets and sample at template coordinates ----
-        warped, align_info = align_to_template(t_gray, s_gray, template_points)
-        binary = _mark_mask(warped)
-        results = []
-        for q in questions:
-            opts = q.get("options") or []
-            ratios = [_fill_ratio(binary, o["x"], o["y"], o["r"]) for o in opts]
-            answer, state, margin = _decide(ratios)
-            results.append({
-                "q": int(q["q"]),
-                "detected": answer,
-                "state": state,
-                "margin": round(float(margin), 3),
-                "fill": [round(float(v), 3) for v in ratios],
-            })
+        matched = _match_groups(student_questions, questions)
+        unreadable = sum(1 for m in matched if m is None)
+        align_info["unreadable"] = unreadable
+
+        if unreadable > len(questions) * MAX_UNREADABLE_FRACTION:
+            grid = None  # too patchy to trust
+        else:
+            results = []
+            for q, student in zip(questions, matched):
+                if student is None:
+                    # Nothing was found where this question should be. Say so
+                    # rather than inventing an answer from the wrong bubbles.
+                    results.append({
+                        "q": int(q["q"]),
+                        "detected": None,
+                        "state": "uncertain",
+                        "margin": 0.0,
+                        "fill": [],
+                    })
+                    continue
+                opts = student["options"]
+                ratios = [_fill_ratio(binary, o["x"], o["y"], o["r"]) for o in opts]
+                answer, state, margin = _decide(ratios)
+                results.append({
+                    "q": int(q["q"]),
+                    "detected": answer,
+                    "state": state,
+                    "margin": round(float(margin), 3),
+                    "fill": [round(float(v), 3) for v in ratios],
+                })
+
+    if grid is None:
+        # Refuse rather than guess.
+        #
+        # The obvious fallback -- warp the photo onto the template and sample at
+        # the template's coordinates -- was measured returning 9 of 60 answers
+        # correct on a noisy sheet while reporting no error at all. An OMR sheet
+        # is a lattice of identical circles, so a registration that is off by one
+        # row fits beautifully and shifts every answer. Marks that are quietly
+        # wrong are far worse for a student than an evaluation that declines.
+        raise OmrError(
+            "Could not read the bubble grid on this sheet reliably%s. Please "
+            "re-photograph it flat and straight-on, with the whole sheet in "
+            "frame, in even light and without shadows across the page."
+            % (" (%s)" % align_info["reason"] if align_info.get("reason") else "")
+        )
 
     marked = sum(1 for r in results if r["state"] in ("single", "multiple"))
     if marked == 0:
