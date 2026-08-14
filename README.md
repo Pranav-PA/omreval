@@ -43,9 +43,14 @@ Close and reopen your terminal after installing so `PATH` picks them up.
    [`supabase/schema.sql`](supabase/schema.sql) and run it. That creates the
    `omr_templates` and `omr_evaluations` tables, the row level security
    policies, and the public `omr` storage bucket.
-3. Under **Authentication → Providers → Email**, decide whether to keep
-   *Confirm email* on. If you leave it on, add
-   `https://<your-domain>/auth/callback` to **URL Configuration → Redirect URLs**.
+3. Under **Authentication → URL Configuration**, set the **Site URL** to your
+   deployed origin and add every `/auth/callback` URL that should be allowed to
+   receive a confirmation link — production, `http://localhost:3000/auth/callback`
+   for local dev, and a wildcard for Vercel preview builds.
+4. Under **Authentication → Sign In / Providers**, decide whether to keep
+   *Confirm email* on. Leaving it on is the safer default, but Supabase's
+   built-in mailer is heavily rate limited on the free plan; turn it off (or
+   wire up a real SMTP provider) if you are inviting a lot of teachers at once.
 
 ### 2. Configure environment
 
