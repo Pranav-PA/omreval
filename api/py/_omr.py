@@ -267,10 +267,170 @@ def _cluster_columns(groups):
     return columns
 
 
-def _build_grid(bubbles, options_per_question, numbering):
+def _dominant_row_lattice(groups, tolerance):
+    """Find the row spacing that explains the most question groups.
+
+    Answer rows sit on one regular pitch. Other bubble blocks on the sheet (the
+    roll-number grid, the "correct method" example) have their own spacing and
+    will not fit it, so this both identifies the answer grid and rejects the
+    impostors. Returns (origin_y, pitch, fitting_groups).
+    """
+    if len(groups) < 4:
+        return None
+
+    ys = np.array(sorted(g["y"] for g in groups), dtype=np.float64)
+    diffs = np.diff(ys)
+    candidates = sorted({round(float(d), 1) for d in diffs if d > tolerance})
+    if not candidates:
+        return None
+
+    best = None
+    for pitch in candidates:
+        if pitch <= 0:
+            continue
+        for anchor in ys:
+            offsets = np.abs(((ys - anchor) / pitch + 0.5) % 1.0 - 0.5) * pitch
+            fits = int((offsets <= tolerance).sum())
+            # Prefer more groups explained; break ties toward the larger pitch so
+            # a half-pitch never wins by also fitting every other row.
+            score = (fits, pitch)
+            if best is None or score > best[0]:
+                best = (score, float(anchor), float(pitch))
+
+    if best is None or best[0][0] < 4:
+        return None
+
+    _, anchor, pitch = best
+    fitting = [
+        g for g in groups
+        if abs((((g["y"] - anchor) / pitch + 0.5) % 1.0 - 0.5) * pitch) <= tolerance
+    ]
+    if len(fitting) < 4:
+        return None
+
+    origin = min(g["y"] for g in fitting)
+    return origin, pitch, fitting
+
+
+def _fit_lattice(groups, question_count, options_per_question, numbering):
+    """Rebuild the full question grid from the printed lattice.
+
+    Detecting groups independently fails on real sheets two ways: unrelated
+    bubble blocks look exactly like answer groups, and faint print means genuine
+    rows are missed, which shifts every question number after them. Both go away
+    once the lattice is known -- groups off it are dropped, and rows that were
+    never detected are reconstructed from geometry.
+
+    Returns exactly `question_count` questions, or None if no lattice is found.
+    """
+    if not groups or question_count < 1:
+        return None
+
+    heights = [max(b[2] for b in g["bubbles"]) for g in groups]
+    tolerance = max(float(np.median(heights)) * 0.9, 4.0)
+
+    lattice = _dominant_row_lattice(groups, tolerance)
+    if lattice is None:
+        return None
+    _, pitch, fitting = lattice
+
+    columns = _cluster_columns(fitting)
+    if not columns:
+        return None
+
+    # Keep the columns that carry the answer grid; a stray block contributes far
+    # fewer groups than a real column of questions.
+    biggest = max(len(c["items"]) for c in columns)
+    kept = [c for c in columns if len(c["items"]) >= max(2, biggest * 0.4)]
+    if not kept:
+        return None
+
+    n_cols = len(kept)
+    rows_per_col = int(round(question_count / float(n_cols)))
+    if rows_per_col < 1 or n_cols * rows_per_col != question_count:
+        return None
+
+    # Anchor on the rows the answer grid actually occupies.
+    #
+    # Taking the topmost fitting group would anchor on the roll-number block,
+    # which shares an x-range with the first answer column and so survives column
+    # filtering. Answer rows are distinguished by spanning several columns, so
+    # score every window of `rows_per_col` consecutive rows by how many
+    # column-row cells are occupied and keep the best one.
+    ordered = sorted(kept, key=lambda c: c["x"])
+    base = min(g["y"] for c in ordered for g in c["items"])
+
+    support = {}
+    for column_index, col in enumerate(ordered):
+        for g in col["items"]:
+            index = int(round((g["y"] - base) / pitch))
+            support.setdefault(index, set()).add(column_index)
+
+    if not support:
+        return None
+    lo, hi = min(support), max(support)
+    best_start, best_score = lo, -1
+    for start in range(lo, max(lo, hi - rows_per_col + 1) + 1):
+        score = sum(
+            len(support.get(start + offset, ())) for offset in range(rows_per_col)
+        )
+        if score > best_score:
+            best_start, best_score = start, score
+
+    origin = base + pitch * best_start
+    window = range(best_start, best_start + rows_per_col)
+
+    built = []
+    for column_index, col in enumerate(ordered):
+        # Measure geometry only from groups inside the answer window, so a
+        # roll-number group cannot drag a column's x position sideways.
+        items = [
+            g for g in col["items"]
+            if int(round((g["y"] - base) / pitch)) in window
+        ] or col["items"]
+        starts = np.array([g["bubbles"][0][0] for g in items], dtype=np.float64)
+        offsets = np.median(
+            np.array(
+                [[b[0] - g["bubbles"][0][0] for b in g["bubbles"]] for g in items],
+                dtype=np.float64,
+            ),
+            axis=0,
+        )
+        radius = float(np.median([b[2] for g in items for b in g["bubbles"]]))
+        x0 = float(np.median(starts))
+
+        for row_index in range(rows_per_col):
+            y = origin + pitch * row_index
+            built.append({
+                "column": column_index,
+                "row": row_index,
+                "options": [
+                    {
+                        "option": OPTION_LABELS[j],
+                        "x": round(x0 + float(offsets[j]), 2),
+                        "y": round(y, 2),
+                        "r": round(radius, 2),
+                    }
+                    for j in range(options_per_question)
+                ],
+            })
+
+    if numbering == "row":
+        built.sort(key=lambda q: (q["row"], q["column"]))
+    else:
+        built.sort(key=lambda q: (q["column"], q["row"]))
+
+    questions = []
+    for i, q in enumerate(built):
+        questions.append({"q": i + 1, "options": q["options"]})
+    return questions
+
+
+def _detect_groups(bubbles, options_per_question):
+    """Raw option groups, before any lattice reasoning."""
     kept, median_r = _keep_consistent_sizes(bubbles)
     if len(kept) < options_per_question * 4:
-        return None
+        return []
 
     rows = _cluster_rows(kept, median_r)
     groups = []
@@ -284,8 +444,20 @@ def _build_grid(bubbles, options_per_question, numbering):
                 "bubbles": g,
                 "column": 0,
             })
+    return groups
+
+
+def _build_grid(bubbles, options_per_question, numbering, question_count=None):
+    groups = _detect_groups(bubbles, options_per_question)
     if not groups:
         return None
+
+    # Preferred: reconstruct the printed lattice. Only possible when we know how
+    # many questions to expect, which the teacher tells us.
+    if question_count:
+        fitted = _fit_lattice(groups, question_count, options_per_question, numbering)
+        if fitted is not None:
+            return fitted
 
     _cluster_columns(groups)
 
@@ -320,7 +492,8 @@ def detect_bubbles(image_bytes, options_per_question=4, expected_questions=45,
     best = None
     for binary in _binarise_variants(gray):
         candidates = _dedupe(_candidate_bubbles(binary))
-        grid = _build_grid(candidates, options_per_question, numbering)
+        grid = _build_grid(candidates, options_per_question, numbering,
+                           question_count=expected_questions)
         if grid is None:
             continue
         # Prefer the variant that lands closest to the expected question count.
@@ -578,6 +751,11 @@ def _read_student_grid(s_gray, question_count, options_per_question, numbering):
     best = None
     for binary in _binarise_variants(deskewed):
         candidates = _dedupe(_candidate_bubbles(binary))
+        # Deliberately no lattice fit here. The template is a flat scan, so a
+        # single row pitch describes it exactly; a student photo has perspective,
+        # which makes row spacing vary down the page. Forcing one pitch onto it
+        # produces a confident but wrong grid. Clustering tolerates the drift,
+        # and _match_groups maps whatever is found onto the template's questions.
         grid = _build_grid(candidates, options_per_question, numbering)
         if grid is None:
             continue
