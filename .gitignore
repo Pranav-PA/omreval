@@ -21,3 +21,6 @@ venv/
 # Debug images the tests write while running
 tests/*.jpg
 tests/*.png
+
+# Scratch build dir used by the geometry parity test
+.tmp-parity/

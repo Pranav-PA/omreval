@@ -495,6 +495,71 @@ def _build_grid(bubbles, options_per_question, numbering, question_count=None):
     return questions
 
 
+def suggest_anchors(image_bytes, columns, rows, options):
+    """Best guess at where the four template anchors belong.
+
+    This is only a starting position for the markers the teacher then drags;
+    nothing downstream trusts it. Detection is allowed to be wrong here in a way
+    it never was when it defined the grid outright.
+    """
+    img = normalise(decode_image(image_bytes))
+    height, width = img.shape[:2]
+    gray = to_gray(img)
+
+    groups = []
+    for binary in _binarise_variants(gray):
+        found = _detect_groups(_dedupe(_candidate_bubbles(binary)), options)
+        if len(found) > len(groups):
+            groups = found
+
+    suggestion = None
+    if groups:
+        # Use the largest consistent block of groups: the answer grid dominates
+        # the page, so its extent is a reasonable first guess even when stray
+        # blocks were also picked up.
+        xs = np.array([g["x_start"] for g in groups], dtype=np.float64)
+        ys = np.array([g["y"] for g in groups], dtype=np.float64)
+        radius = float(np.median([b[2] for g in groups for b in g["bubbles"]]))
+        spans = np.array([g["x_end"] - g["x_start"] for g in groups], dtype=np.float64)
+        option_span = float(np.median(spans)) if len(spans) else width * 0.05
+
+        left = float(np.percentile(xs, 2))
+        right = float(np.percentile(xs, 98))
+        top = float(np.percentile(ys, 2))
+        bottom = float(np.percentile(ys, 98))
+
+        suggestion = {
+            "first_option": (left, top),
+            "last_option": (left + option_span, top),
+            "last_row": (left, bottom),
+            "last_column": (right, top),
+            "radius": radius,
+        }
+
+    if suggestion is None:
+        # Nothing usable found: place the markers over the middle of the page so
+        # the teacher has something visible to drag rather than an error.
+        suggestion = {
+            "first_option": (width * 0.15, height * 0.40),
+            "last_option": (width * 0.15 + width * 0.06, height * 0.40),
+            "last_row": (width * 0.15, height * 0.88),
+            "last_column": (width * 0.80, height * 0.40),
+            "radius": max(6.0, width * 0.008),
+        }
+
+    return {
+        "width": width,
+        "height": height,
+        "columns": columns,
+        "rows": rows,
+        "options_per_question": options,
+        "anchors": {k: [round(v[0], 2), round(v[1], 2)]
+                    for k, v in suggestion.items() if k != "radius"},
+        "radius": round(float(suggestion["radius"]), 2),
+        "detected_groups": len(groups),
+    }
+
+
 def detect_bubbles(image_bytes, options_per_question=4, expected_questions=45,
                    numbering="column"):
     img = normalise(decode_image(image_bytes))

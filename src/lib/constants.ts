@@ -5,6 +5,41 @@ export const QUESTION_COUNT_PRESETS = [45, 50, 60, 90, 100, 180, 200];
 export const MIN_QUESTION_COUNT = 1;
 export const MAX_QUESTION_COUNT = 250;
 
+/** Sheet layout: questions are laid out in columns x rows. */
+export const DEFAULT_COLUMNS = 4;
+export const DEFAULT_ROWS = 15;
+export const MAX_COLUMNS = 20;
+export const MAX_ROWS = 100;
+
+export const ANCHOR_KEYS = [
+  'first_option',
+  'last_option',
+  'last_row',
+  'last_column',
+] as const;
+
+export type AnchorKey = (typeof ANCHOR_KEYS)[number];
+
+/** What each marker means, in the teacher's words. */
+export const ANCHOR_LABELS: Record<AnchorKey, { title: string; hint: string }> = {
+  first_option: {
+    title: 'Question 1, option A',
+    hint: 'The very first bubble — top-left of the answer area.',
+  },
+  last_option: {
+    title: 'Question 1, last option',
+    hint: 'The last bubble of that same question (D on a four-option sheet).',
+  },
+  last_row: {
+    title: 'Bottom of the first column, option A',
+    hint: 'Option A of the last question in the left-hand column.',
+  },
+  last_column: {
+    title: 'Top of the last column, option A',
+    hint: 'Option A of the first question in the right-hand column.',
+  },
+};
+
 export const OPTIONS = ['A', 'B', 'C', 'D'] as const;
 export const MARKS_CORRECT = 4;
 export const MARKS_WRONG = 0;

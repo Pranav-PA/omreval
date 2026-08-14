@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api", "py"))
 
 from _handler import decode_b64, run  # noqa: E402
-from _omr import OmrError, detect_bubbles, evaluate_sheet  # noqa: E402
+from _omr import OmrError, detect_bubbles, evaluate_sheet, suggest_anchors  # noqa: E402
 
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -45,9 +45,28 @@ def _evaluate(body):
     )
 
 
+def _suggest(body):
+    def positive(key, default, limit):
+        try:
+            value = int(body.get(key) or default)
+        except (TypeError, ValueError):
+            raise OmrError("'%s' must be a whole number." % key)
+        if value < 1 or value > limit:
+            raise OmrError("'%s' must be between 1 and %d." % (key, limit))
+        return value
+
+    return suggest_anchors(
+        decode_b64(body.get("image"), "template"),
+        positive("columns", 4, 20),
+        positive("rows", 15, 100),
+        positive("options", 4, 6),
+    )
+
+
 ROUTES = {
     "/api/py/detect_bubbles": _detect,
     "/api/py/evaluate_omr": _evaluate,
+    "/api/py/suggest_anchors": _suggest,
 }
 
 

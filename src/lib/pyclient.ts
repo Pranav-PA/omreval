@@ -87,7 +87,7 @@ export function describeFailure(payload: unknown, status: number): string {
 }
 
 export async function callPython<T>(
-  endpoint: 'detect_bubbles' | 'evaluate_omr',
+  endpoint: 'detect_bubbles' | 'evaluate_omr' | 'suggest_anchors',
   body: unknown,
 ): Promise<T> {
   const url = `${await baseUrl()}/api/py/${endpoint}`;

@@ -16,6 +16,37 @@ export interface BubbleQuestion {
   options: BubblePoint[];
 }
 
+/** The four points that define a sheet's geometry, in normalised image px. */
+export type AnchorPoint = [number, number];
+
+export interface Anchors {
+  first_option: AnchorPoint;
+  last_option: AnchorPoint;
+  last_row: AnchorPoint;
+  last_column: AnchorPoint;
+}
+
+/** Reply from /api/suggest-anchors — a starting position, not the grid. */
+export interface AnchorSuggestion {
+  width: number;
+  height: number;
+  columns: number;
+  rows: number;
+  options_per_question: number;
+  anchors: Anchors;
+  radius: number;
+  detected_groups: number;
+}
+
+/** Layout the teacher confirmed, stored with the template. */
+export interface SheetLayout {
+  columns: number;
+  rows: number;
+  options: number;
+  anchors: Anchors;
+  radius: number;
+}
+
 export interface BubblePositions {
   /** Size of the normalised working image the coordinates belong to. */
   width: number;
@@ -25,6 +56,8 @@ export interface BubblePositions {
   detected_questions: number;
   expected_questions: number;
   questions: BubbleQuestion[];
+  /** Present on templates built from anchors, which is now the normal path. */
+  layout?: SheetLayout;
 }
 
 export type AnswerKey = Record<string, Option>;
