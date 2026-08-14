@@ -13,6 +13,7 @@ import {
   QUESTION_COUNT_PRESETS,
   type Option,
 } from '@/lib/constants';
+import { errorText } from '@/lib/errors';
 import { prepareImage } from '@/lib/image';
 import type { BubblePositions } from '@/lib/types';
 
@@ -62,10 +63,18 @@ export default function TemplateCreator() {
       form.append('question_count', String(expectedCount));
 
       const response = await fetch('/api/detect-bubbles', { method: 'POST', body: form });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
 
       if (!response.ok) {
-        setError(data.error || 'Bubble detection failed.');
+        setError(errorText(data, `Bubble detection failed (HTTP ${response.status}).`));
+        return;
+      }
+
+      if (!data?.positions?.questions?.length) {
+        setError(
+          'No bubbles were detected on that sheet. Try a flatter, sharper scan with the ' +
+            'whole sheet in frame.',
+        );
         return;
       }
 
@@ -114,10 +123,10 @@ export default function TemplateCreator() {
           answer_key: answerKey,
         }),
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
 
       if (!response.ok) {
-        setError(data.error || 'Could not save the template.');
+        setError(errorText(data, `Could not save the template (HTTP ${response.status}).`));
         return;
       }
 

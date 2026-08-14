@@ -4,6 +4,8 @@ import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useState } from 'react';
 
+import { errorText } from '@/lib/errors';
+
 type Mode = 'login' | 'signup';
 
 const COPY: Record<Mode, { title: string; cta: string; alt: string; altHref: string; altLabel: string }> = {
@@ -59,14 +61,14 @@ export default function AuthForm({ mode }: { mode: Mode }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: email.trim(), password }),
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
 
       if (!response.ok) {
-        setError(data.error || 'Something went wrong. Please try again.');
+        setError(errorText(data, 'Something went wrong. Please try again.'));
         return;
       }
 
-      if (data.needs_confirmation) {
+      if (data?.needs_confirmation) {
         setNotice(
           `We sent a confirmation link to ${email.trim()}. Click it, then come back and log in.`,
         );

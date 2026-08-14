@@ -28,6 +28,50 @@ export class PyServiceError extends Error {
   }
 }
 
+/** Plain-English hints for the platform failures we can actually hit. */
+const PLATFORM_HINTS: Record<string, string> = {
+  FUNCTION_INVOCATION_TIMEOUT:
+    'the image took too long to process. Try a smaller or less detailed photo.',
+  FUNCTION_INVOCATION_FAILED:
+    'the image processor ran out of memory or crashed on this image.',
+  FUNCTION_PAYLOAD_TOO_LARGE:
+    'the image is too large to send. Try a photo under about 3 MB.',
+  EDGE_FUNCTION_INVOCATION_TIMEOUT:
+    'the image took too long to process. Try a smaller photo.',
+};
+
+/**
+ * Turns any error body into something a teacher can read.
+ *
+ * Our own handler replies `{"error": "message"}`, but a failure at the platform
+ * level (timeout, out-of-memory, oversized body) never reaches our code and
+ * replies `{"error": {"code": ..., "message": ...}}` instead. Stringifying that
+ * naively yields "[object Object]" and destroys the only diagnostic available,
+ * so unpack both shapes and always fall back to something concrete.
+ */
+export function describeFailure(payload: unknown, status: number): string {
+  const raw =
+    payload && typeof payload === 'object' && 'error' in payload
+      ? (payload as { error: unknown }).error
+      : payload;
+
+  if (typeof raw === 'string' && raw.trim()) return raw;
+
+  if (raw && typeof raw === 'object') {
+    const obj = raw as { code?: unknown; message?: unknown };
+    const code = typeof obj.code === 'string' ? obj.code : undefined;
+    const message = typeof obj.message === 'string' ? obj.message : undefined;
+
+    if (code && PLATFORM_HINTS[code]) {
+      return `Image processing failed — ${PLATFORM_HINTS[code]} (${code})`;
+    }
+    if (message) return code ? `${message} (${code})` : message;
+    if (code) return `Image processing failed (${code})`;
+  }
+
+  return `Image processing failed with HTTP ${status}.`;
+}
+
 export async function callPython<T>(
   endpoint: 'detect_bubbles' | 'evaluate_omr',
   body: unknown,
@@ -63,12 +107,12 @@ export async function callPython<T>(
   }
 
   if (!response.ok) {
-    const message =
-      payload && typeof payload === 'object' && 'error' in payload
-        ? String((payload as { error: unknown }).error)
-        : 'Image processing failed.';
-    // 422 = a real, explainable problem with the uploaded image.
-    throw new PyServiceError(message, response.status === 422 ? 422 : 502);
+    // 422 = a real, explainable problem with the uploaded image, raised by our
+    // own handler. Anything else is a platform-level failure.
+    throw new PyServiceError(
+      describeFailure(payload, response.status),
+      response.status === 422 ? 422 : 502,
+    );
   }
 
   return payload as T;

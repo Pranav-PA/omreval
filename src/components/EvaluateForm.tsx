@@ -3,6 +3,7 @@
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
 
+import { errorText } from '@/lib/errors';
 import { prepareImage } from '@/lib/image';
 
 interface TemplateOption {
@@ -68,10 +69,10 @@ export default function EvaluateForm({
       form.append('image', prepared.blob, 'student.jpg');
 
       const response = await fetch('/api/evaluate-omr', { method: 'POST', body: form });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
 
       if (!response.ok) {
-        setError(data.error || 'Evaluation failed.');
+        setError(errorText(data, `Evaluation failed (HTTP ${response.status}).`));
         return;
       }
 
