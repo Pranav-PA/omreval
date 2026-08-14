@@ -284,23 +284,27 @@ def _dominant_row_lattice(groups, tolerance):
     if not candidates:
         return None
 
-    best = None
+    scored = []
     for pitch in candidates:
         if pitch <= 0:
             continue
         for anchor in ys:
             offsets = np.abs(((ys - anchor) / pitch + 0.5) % 1.0 - 0.5) * pitch
             fits = int((offsets <= tolerance).sum())
-            # Prefer more groups explained; break ties toward the larger pitch so
-            # a half-pitch never wins by also fitting every other row.
-            score = (fits, pitch)
-            if best is None or score > best[0]:
-                best = (score, float(anchor), float(pitch))
+            scored.append((fits, float(pitch), float(anchor)))
 
-    if best is None or best[0][0] < 4:
+    if not scored:
         return None
 
-    _, anchor, pitch = best
+    # Half the true pitch fits every row the true pitch does, and picks up junk
+    # besides, so maximising the fit count alone reliably selects a pitch that is
+    # too small and crushes the whole grid into a fraction of the page. Take the
+    # largest pitch that still explains almost as much.
+    best_fits = max(s[0] for s in scored)
+    if best_fits < 4:
+        return None
+    plausible = [s for s in scored if s[0] >= best_fits * 0.9]
+    _, pitch, anchor = max(plausible, key=lambda s: s[1])
     fitting = [
         g for g in groups
         if abs((((g["y"] - anchor) / pitch + 0.5) % 1.0 - 0.5) * pitch) <= tolerance
@@ -368,6 +372,14 @@ def _fit_lattice(groups, question_count, options_per_question, numbering):
 
     if not support:
         return None
+
+    # Sanity check the pitch before trusting it. If it is a fraction of the true
+    # spacing, the detected groups spread over far more lattice rows than the
+    # sheet actually has, and the rebuilt grid collapses into a band. Better to
+    # fall back to plain clustering than to emit a confident, wrong geometry.
+    if len(support) > rows_per_col * 1.5:
+        return None
+
     lo, hi = min(support), max(support)
     best_start, best_score = lo, -1
     for start in range(lo, max(lo, hi - rows_per_col + 1) + 1):
