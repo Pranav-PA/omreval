@@ -17,3 +17,7 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Debug images the tests write while running
+tests/*.jpg
+tests/*.png
