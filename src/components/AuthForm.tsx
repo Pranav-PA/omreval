@@ -35,6 +35,13 @@ export default function AuthForm({ mode }: { mode: Mode }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  // /auth/callback sends the teacher back here when a confirmation link is
+  // stale or already used, so say what happened rather than showing a bare form.
+  const callbackError =
+    searchParams.get('error') === 'confirmation_failed'
+      ? 'That confirmation link did not work — it may have expired or already been used. Log in below, or sign up again to get a fresh link.'
+      : null;
+
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
     setError(null);
@@ -78,6 +85,10 @@ export default function AuthForm({ mode }: { mode: Mode }) {
   return (
     <div className="mx-auto max-w-md">
       <h1 className="text-2xl font-bold tracking-tight">{copy.title}</h1>
+
+      {callbackError && !error && !notice && (
+        <p className="alert-warn mt-6">{callbackError}</p>
+      )}
 
       <form onSubmit={onSubmit} className="card mt-6 space-y-4">
         <div>
