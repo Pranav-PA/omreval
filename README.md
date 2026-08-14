@@ -103,8 +103,15 @@ where to find the service, then open http://localhost:3000.
    (leave `PYTHON_API_URL` unset).
 3. Under **Settings → Functions**, confirm the Python runtime version is 3.12.
 
-`vercel.json` gives the Python functions 3009 MB and a 60 s ceiling — OpenCV
-needs the headroom on large scans. `requirements.txt` is installed automatically.
+`vercel.json` gives the Python functions a 60 s ceiling; `requirements.txt` is
+installed automatically (Vercel provisions Python 3.12 via uv).
+
+> **Do not add a `memory` setting to `vercel.json`.** The Hobby plan caps
+> serverless functions at 2048 MB, and requesting more makes *every* deployment
+> fail validation instantly — the deploy hook still returns `201 PENDING`, but
+> no deployment is ever created, so the dashboard just shows "No Production
+> Deployment" with no error anywhere. On Active CPU billing the setting is
+> ignored regardless, so leave it out.
 
 Optionally set `PY_SHARED_SECRET` to the same value on both sides; the Python
 endpoints then reject any request that does not carry it.
